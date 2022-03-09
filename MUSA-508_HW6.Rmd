@@ -18,6 +18,24 @@ output:
 # MUSA 508 - Assignment 6
 
 ```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, warning = F, error = F, message = F, results = F, cache=T)
+
+# load libraries
+library(sf)
+library(riem)
+library(caret)
+library(spdep)
+library(knitr)
+library(ggmap)
+library(gifski)
+library(tigris)
+library(stringr)
+library(mapview)
+library(tidyverse)
+library(lubridate)
+library(gganimate)
+library(gridExtra)
+library(kableExtra)
 
 source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
 
