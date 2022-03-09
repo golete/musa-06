@@ -1,0 +1,919 @@
+---
+title: "Citi Bike demand predictions"
+knit: (function(input_file, encoding) {
+  out_dir <- 'docs';
+  rmarkdown::render(input_file,
+ encoding=encoding,
+ output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
+author: "Adrián Leon"
+date: "10/25/2021"
+output: 
+  html_document: 
+    toc: true
+    toc_float: true
+    code_folding: hide
+    
+---
+
+# MUSA 508 - Assignment 6
+
+```{r setup, include=FALSE}
+
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+# palettes
+palette5 <- c("#eff3ff","#bdd7e7","#6baed6","#3182bd","#08519c")
+palette4 <- c("#D2FBD4","#92BCAB","#527D82","#123F5A")
+palette2 <- c("#6baed6","#08519c")
+
+# function shortcuts
+g <- glimpse
+m <- mapview
+len <- length
+st_c <- st_coordinates
+
+```
+
+The [booming](https://archive.curbed.com/2019/12/16/20864145/bike-share-citi-bike-jump-uber) bike-sharing programs in US metropolitan centers are one of the few tech-enabled innovations in urban transportation over the last decade that, despite being less flashy than automated vehicles or delivery drones, have actually been successfully implemented, integrated with other forms of transportation, and grown steadily, in number of programs and stations within those programs, aided by a widespread popularity with cities’ inhabitants.
+
+
+However, one of the main challenges of these systems is that they rely on the deployment of a fleet of trucks to redistribute bikes across a system’s stations and counterbalance the natural aggregated flow of people’s origin-destination trips throughout the city. The resulting dispersion can rapidly disrupt the system’s operations, since a completely full or completely empty station is rendered unusable and their capacity tends to be limited, even in dense sectors of the city.
+
+
+The goal of this exercise is to develop an algorithm to predict the use of New York City’s Citi Bike bike share system in the borough of Brooklyn and help plan the daily operations of bike redistribution by forecasting the demand by hour in at least the following week. The idea is to move bikes from stations with low forecasted demand, but more than half of their docks occupied, to stations with high forecasted demand on the shortest distance possible and on-time, expanding the actual dock capacity of the highly used stations.
+
+
+Only the Citibike stations of Brooklyn are selected for various reasons. First, Citi Bikes are the bike share program with more stations in the United States, in fact, Brooklyn would be the fifth city with most stations if it were a standalone system. Second, redistributing operations are most efficient if they operate in shorter distances, and most Citi bike trips tend to be inter-borough trips, as evidenced by the following table:
+
+
+```{r origin destinations, results='markup'}
+
+data.frame('origin'=c('Manhattan','Brooklyn','Queens'),
+           'M'=c(1955706,43624,6454),
+           'B'=c(43297,396396,6293),
+           'Q'=c(6260,6532,55326)) %>%
+  kable(caption = "Citibike trips between NYC boroughs") %>%
+    kable_styling("striped", full_width = F)
+
+```
+Bikes to and from Manhattan from Brooklyn are only around 11% of the internal Brooklyn trips, while trips to and from Queens only represent about 2%.
+
+For testing the usability of this model, the Citi bike data collected and use to build the prediction model corresponds to a five week period in September and October of 2019, with milder weather conditions and previous to the affectations caused by the COVID pandemic.
+
+
+
+---
+
+### Data Exploration
+
+
+```{r load bike station data}
+
+# merge monthly CSV files into one
+data <- rbind(read.csv("../../MUSA-508_HW6/data/201909-citibike-tripdata.csv"),
+              read.csv("../../MUSA-508_HW6/data/201910-citibike-tripdata.csv"))
+
+# get station locations and names
+dataStations <- data %>%
+  dplyr::select(start.station.id,
+                start.station.latitude,
+                start.station.longitude) %>%
+  mutate(id = as.character(start.station.id)) %>%
+  dplyr::select(-start.station.id) %>%
+  distinct() %>%
+  st_as_sf(coords = c("start.station.longitude", "start.station.latitude"), crs = 4326, agr = "constant")
+  
+
+# trim only needed data and convert to time intervals
+dataBike <- data %>%
+  dplyr::select(
+    starttime,
+    start.station.id,
+    end.station.id) %>%
+  mutate(interval60 = floor_date(ymd_hms(starttime), unit = "hour"),
+         interval15 = floor_date(ymd_hms(starttime), unit = "15 mins"),
+         week = week(interval60),
+         dotw = wday(interval60, label=TRUE),
+         startID = as.character(start.station.id),
+         endID = as.character(end.station.id)) %>%
+  dplyr::select(startID, endID, interval15, interval60, week, dotw) %>%
+  filter(week %in% c(39:43))                                                   # subset to 5 weeks
+
+
+```
+
+
+The base of this model will be bike trips recorded by their origin station and the time of the day they began, rounded up in both 15 and 60 minute intervals for simplicity. From the date, the week of the year and day of the week are also extracted to organize and partition the data.
+
+
+Aside from the internal demand variables of the bike system, three external variables of weather conditions that may affect ridership are considered: **precipitation**, **temperature** and **wind speed**.
+
+
+
+
+```{r weather data, fig.height=8, fig.width=12}
+
+# get weather data
+weatherData <- 
+  riem_measures(station = "LGA", date_start = "2019-09-24", date_end = "2019-11-23")
+
+# convert into panel
+weatherPanel <-  
+  weatherData %>%
+  mutate_if(is.character, list(~replace(as.character(.), is.na(.), "0"))) %>%  # convert string NAs to NAs and then to 0s
+  replace(is.na(.), 0) %>%                                                     # convert NAs to 0s
+  mutate(interval60 = ymd_h(substr(valid, 1, 13))) %>%                         # round to hour intervals
+  mutate(week = week(interval60),                                              # get week
+         dotw = wday(interval60, label=TRUE)) %>%                              # get day of the week
+  group_by(interval60) %>%                                                     # group by hour ?? why
+  summarize(Temperature = max(tmpf),                                           # summarize temperature, precipitation and windspeed
+            Precipitation = sum(p01i),
+            WindSpeed = max(sknt)) %>%
+  mutate(Temperature = ifelse(Temperature == 0, 42, Temperature)) %>%
+  mutate(Temperature = (Temperature-32)/1.8)                                   # Fahrenheit to Celsius
+
+# create charts by weather indicator
+grid.arrange(top = "Weather Data: New York City, September & October 2019",
+  ggplot(weatherPanel, aes(interval60, Precipitation)) +
+    geom_line() +
+    labs(title="Precipitation", x="Hour", y="Precipitation") +
+    plotTheme() +
+    theme(panel.border = element_blank(),
+        panel.background = element_rect(fill = "#eeeeee")),
+  ggplot(weatherPanel, aes(interval60, WindSpeed)) +
+    geom_line() + 
+    labs(title="Wind Speed", x="Hour", y="Wind Speed") +
+    plotTheme() +
+    theme(panel.border = element_blank(),
+        panel.background = element_rect(fill = "#eeeeee")),
+  ggplot(weatherPanel, aes(interval60, Temperature)) +
+    geom_line() + 
+    labs(title="Temperature", x="Hour", y="Temperature (ºC)") +
+    plotTheme() +
+    theme(panel.border = element_blank(),
+          panel.background = element_rect(fill = "#eeeeee")))
+
+```
+
+
+Since Citi bike's open data historic records include the entire system's operation, the census tracts corresponding to Brooklyn (Kings County) are used to subset only the trips that end or start in these tracts, and therefore, the bike-share stations in Brooklyn. Additionally, the *Neighborhood Tabulation Areas* defined by the [city of New York](https://data.cityofnewyork.us/City-Government/NTA-map/d3qk-pfyz) to indicate its neighborhoods, are used as spatial variables to spatially cross-validate the model in a further step.
+
+
+
+```{r brooklyn data}
+
+# get all tracts by county (Brooklyn is Kings County)
+trBrooklyn <- tigris::tracts(state = 36, county = "Kings")
+
+# get tracts where there are stations
+bklynTracts <- trBrooklyn %>%
+  dplyr::select(GEOID, geometry) %>%
+  st_transform(st_crs(dataStations))
+
+hoodBrooklyn <- st_read('./data/NTAmap.geojson') %>% # get the Brooklyn neighborhoods where there are stations
+  filter(borocode == 3) %>%
+  dplyr::select(ntaname, geometry) %>%
+  st_transform(st_crs(dataStations))
+
+# get stations in Brooklyn tracts
+bklynStations <- dataStations %>%
+  st_join(bklynTracts, left = F)
+
+# fo;ter trips that start and end in Brooklyn
+bklynBike <- dataBike %>%
+  filter(startID %in% bklynStations$id & endID %in% bklynStations$id)
+
+# station with both starts and ends
+bklynSpatial <- bklynBike %>%
+  dplyr::select(startID) %>%
+  distinct %>%
+  left_join(bklynStations, by = c('startID'='id')) %>%
+  st_sf()
+
+# Add neighborhoods
+bklynSpatialFinal <-
+  bklynSpatial %>% st_join(hoodBrooklyn)%>%
+  rename('id' = startID) %>%
+  drop_na()
+
+bklynBikeTrips <- bklynBike %>%
+  mutate(n = 1) %>%
+  group_by(startID, interval60) %>%
+  rename('station' = startID) %>%
+  summarize(tripCount = sum(n))
+
+
+# remove unused variables for memory
+rm(data)
+rm(dataBike)
+rm(dataStations)
+rm(weatherData)
+
+
+# create empty panel with all possible time/space combinations
+basePanel <- 
+  expand.grid(interval60 = unique(bklynBike$interval60), 
+              station = unique(bklynBike$startID))
+
+# join trips information into panel by hour
+tripsPanel <- 
+  bklynBikeTrips %>%
+  right_join(basePanel) %>%
+  left_join(weatherPanel, by = "interval60") %>%
+  mutate(week = week(interval60),
+         dotw = wday(interval60, label = TRUE))
+
+# create lag variables
+bikePanel <- 
+  tripsPanel %>% 
+  arrange(station, interval60) %>% 
+  replace(is.na(.), 0) %>%
+  group_by(station) %>% 
+  mutate(lagHour = dplyr::lag(tripCount, 1),
+         lag2Hours = dplyr::lag(tripCount, 2),
+         lag3Hours = dplyr::lag(tripCount, 3),
+         lag4Hours = dplyr::lag(tripCount, 4),
+         lag12Hours = dplyr::lag(tripCount, 12),
+         lag1day = dplyr::lag(tripCount, 24)) %>%
+  ungroup()
+
+# version of bikePanel with tracts and neighborhoods
+bikePanelSpatial <- bikePanel %>%
+  left_join(bklynSpatialFinal, by=c("station"="id")) %>%
+  rename('nhood' = ntaname) %>%
+  st_sf()
+
+# Partition the resulting data in two sets, training on 3 weeks and testing on the following 2
+bikeTrain <- filter(bikePanelSpatial, week <= 41)
+bikeTest <- filter(bikePanelSpatial, week > 41)
+
+```
+
+
+Finally, all of the variables above are condensed into one single panel of tables.
+
+---
+
+
+### Exploratory Analysis
+
+
+The five-week period that comprises the source data is initially split into three weeks of data for training the model and two weeks to test and predict on:
+
+
+
+```{r fig.height=3, fig.width=12}
+
+# set beginning of 'week' according to january 1st
+tuesdays <- 
+  mutate(bikePanel,
+         sunday = ifelse(dotw == "Tue" & hour(interval60) == 1,
+                         interval60, 0)) %>%
+  filter(sunday != 0) 
+
+
+rbind(
+  mutate(bikeTrain, legend = "Training"), 
+  mutate(bikeTest, legend = "Testing")) %>%
+  group_by(legend, interval60) %>% 
+  summarize(tripCount = sum(tripCount)) %>%
+  ungroup() %>% 
+  ggplot(aes(interval60, tripCount, colour = legend)) +
+  geom_line() +
+  scale_colour_manual(values = palette2) +
+  geom_vline(data = tuesdays, aes(xintercept = sunday)) +
+  labs(title="Citi bike trips in Brooklyn by week",
+       subtitle = "5-week period in September-October 2019",
+       x="",
+       y="Trip Count") +
+  plotTheme() +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "#eeeeee")
+        )
+
+```
+
+In order to assess the usefulness of the lag hour variables, a side-by-side comparison of bike trips as a function of lagged bike trips is shown. Unsurprisingly, it denotes that a 12-hour lag has no correlation with the amount of trips that occurred 12 hours before, demonstrating the stark difference between patterns by day and by night. On the other hand, the rest of the lag counts are useful, especially the 1-hour and 24-hour lags as they are more chronologically related to the observed patterns.
+
+
+```{r lag correlation, fig.width=12, fig.height=3}
+
+plotData_lag <-
+  filter(as.data.frame(bikePanel), week == 39) %>%
+  dplyr::select(starts_with("lag"), tripCount) %>%
+  gather(Variable, Value, -tripCount) %>%
+  mutate(Variable = fct_relevel(Variable, "lagHour","lag2Hours","lag3Hours",
+                                          "lag4Hours","lag12Hours","lag1day"))
+
+# get the correlation between trip counts per station and their lag in time
+correlation_lag <-
+  group_by(plotData_lag, Variable) %>%
+    summarize(correlation = round(cor(Value, tripCount, use = "complete.obs"), 2))
+
+# plot chart of correlations between trip counts and lagged trip counts
+ggplot(plotData_lag, aes(Value, tripCount)) +
+  geom_point(size = 0.1) +
+  geom_text(data = correlation_lag,
+            aes(label = paste("r =", round(correlation, 2))),
+            x=-Inf, y=Inf, vjust = 1.5, hjust = -.1, colour = "blue") +
+  facet_wrap(~Variable, ncol = 6) +
+  geom_smooth(method = "lm", se = FALSE, colour = "blue") +
+  labs(title = "Bike trips as a function of lagged trips",
+       subtitle = "lags of 1, 2, 3, 4, 12, and 24 hours") +
+  plotTheme() +
+  theme(panel.border = element_blank(),
+        panel.background = element_rect(fill = "#eeeeee"),
+        strip.background = element_rect(fill = "#eeeeee"),
+        strip.text.x = element_text(size = 12, color = '#222222')
+        )
+
+```
+
+Bike trips can be visualized across the different weeks observed to look for spatial and temporal patterns. The most obvious here is the clustering of high trip demand in the increasingly densifying Williamsburg, DUMBO, Fort Greene, Park Slope and Central Brooklyn neighborhoods.
+
+
+```{r fig.height=4, fig.width=12}
+
+tripTracts <- st_drop_geometry(bklynStations) %>%
+  dplyr::select(-id) %>%
+  left_join(bklynTracts, by='GEOID') %>%
+  distinct(GEOID, .keep_all = T) %>%
+  st_sf()
+
+tripPoints <- bikePanel %>%
+  group_by(week, station) %>%
+  summarize(sumTripCount = sum(tripCount)) %>%
+  ungroup() %>%
+  left_join(bklynStations, by=c('station'='id')) %>%
+  st_sf()
+ 
+
+# side by side graduate symbol maps 
+tripPoints %>% 
+  ggplot() +
+  geom_sf(data=tripTracts, colour = "#eeeeee", fill = "#dddddd") +
+  geom_sf(pch = 21,
+          colour = 'NA',
+          alpha = 0.66,
+          aes(size = sumTripCount,
+          fill = sumTripCount)) +
+  facet_wrap(~week, ncol = 5) +
+  scale_fill_viridis_c(option = "plasma",
+                        breaks=c(0,250,500,750,1000,1250)) +
+  scale_size_continuous(
+    range = c(0,4.5)) +
+  labs(title="Citi bike trips per week and station in Brooklyn",
+       subtitle = "September-October 2019") +
+  guides(size = F,
+         fill=guide_colorbar(title="trips per station", barwidth = 20)) +
+  mapTheme() +
+  theme(legend.position = "bottom",
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "#eeeeee"),
+        panel.grid = element_blank(),
+        strip.background = element_rect(fill = "#eeeeee"),
+        strip.text.x = element_text(size = 12, color = '#222222', hjust=0.01)
+        )
+
+```
+
+However, we are mostly interested in how these patterns change throughout the day. In order to visualize this we look into changes at 15-min intervals of trips generated by station, during one whole day, specifically a Tuesday because of its ['neutrality'](https://www.youtube.com/watch?v=KfhFfDQ8YJo).
+
+
+
+```{r spacetime correlation, results='markup'}
+
+# filter bike data for just september 24 2019
+week39 <- bklynBike %>%
+  filter(week == 39 & dotw == "Tue")
+
+# create empty panel with all station-time combinations
+week39Panel <-
+  expand.grid(
+    interval15 = unique(week39$interval15),
+    station = unique(bklynBike$startID))
+
+# alternate mode of counting trips
+week39Trips <- bklynBike %>%
+  filter(week == 39) %>%
+  mutate(n = 1) %>%
+  group_by(startID, interval15) %>%
+  rename('station' = startID) %>%
+  summarize(tripCount = sum(n))
+
+# put data together for sept 24
+bikeAnimationData <-
+  week39Trips %>%
+    right_join(week39Panel) %>% 
+    left_join(bklynStations, by=c("station" = "id")) %>%
+    st_sf()
+
+# create map per 15 minute interval
+animation <- 
+  bikeAnimationData %>% 
+  ggplot() +
+  geom_sf(data=tripTracts, colour = "#eeeeee", fill = "#dddddd") +
+  geom_sf(pch = 21,
+          colour = 'NA',
+          alpha = 0.8,
+          aes(size = tripCount,
+          fill = tripCount)) +
+  scale_fill_viridis_c(option = "plasma",
+                        breaks=c(0,250,500,750,1000,1250)) +
+  scale_size_continuous(
+    range = c(0,7)) +
+  labs(title="Citi Bike trips on Brooklyn per station",
+       subtitle = "15 minute intervals: {current_frame}") +
+  guides(size = F,
+         fill=guide_colorbar(title="trips per station", barwidth = 20)) +
+  transition_manual(interval15) +
+  mapTheme() +
+  theme(legend.position = "bottom",
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "#eeeeee"),
+        panel.grid = element_blank(),
+        strip.background = element_rect(fill = "#eeeeee"),
+        strip.text.x = element_text(size = 12, color = '#222222', hjust=0.01)
+        )
+
+# plot animation
+animate(animation, duration=20, renderer = gifski_renderer())
+
+# save animation locally
+#anim_save("CitiBike", animation, duration=20, renderer = gifski_renderer())
+
+```
+
+
+In the animation, it is noticeable that during the morning peak hour, the demand of trips is more evenly distributed across all the neighborhoods, especially the more residential ones in central Brooklyn and Williamsburg-Green Point. However, during the 18h-19h peak hours, trip demand is much more concentrated in the denser and office-occupied parts of Downtown Brooklyn and the increasingly commercial Williamsburg.
+
+
+Another important aspect to consider in this model is how much is ridership affected during rainy or snowy periods, which affect much greatly people's willingness to travel in the open conditions. 
+
+
+```{r precipitation chart, fig.height=4, fig.width=4}
+
+bikePanel %>%
+  group_by(interval60) %>% 
+  summarize(tripCount = mean(tripCount),
+            Precipitation = first(Precipitation)) %>%
+  mutate(isPrecip = ifelse(Precipitation > 0,"Rain/Snow", "None")) %>%
+  group_by(isPrecip) %>%
+  summarize(meanTripCount = mean(tripCount)) %>%
+  ggplot(aes(isPrecip, meanTripCount, fill=isPrecip)) + 
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("None" = "#222222",
+                               "Rain/Snow" = "#1b98e0")) +
+  labs(title='Variation of ridership by precipitation',
+           x="Precipitation", y="Mean Trip Count") +
+  plotTheme() +
+  theme(legend.position = "none",
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "#ffffff"),
+        panel.grid.major.x = element_blank(),
+        strip.text.x = element_text(size = 12)
+        )
+
+```
+
+Notably, mean ridership drops to less than half when there is precipitation. Meanwhile, as explained by the following chart, outside temperature seems to have a small but not completely determinat effect in bike-share demand.
+
+
+```{r temperature, fig.height=3.5, fig.width=12}
+
+# temperature as a function of ridership by week
+
+bikePanel %>%
+  group_by(interval60) %>% 
+  summarize(tripCount = mean(tripCount),
+            temperature = first(Temperature)) %>%
+  mutate(week = week(interval60)) %>%
+  ggplot(aes(temperature, tripCount)) + 
+  geom_point(aes(color=temperature)) +
+  scale_color_gradient(low="#1b98e0", high="red") +
+  geom_smooth(method = "lm", se= FALSE, color='#ffffff') +
+  facet_wrap(~week, ncol=5) + 
+  labs(title="Citi bike ridership in Brooklyn as a fuction of temperature (Celsius) by week",
+         subtitle='September-October 2019',
+         x="Temperature", y="Mean Trip Count") +
+  plotTheme() +
+  theme(panel.border = element_blank(),
+        panel.background = element_rect(fill = "#222222"),
+        panel.grid = element_blank(),
+        panel.grid.major = element_blank(),
+        strip.background = element_rect(fill = "#222222"),
+        strip.text.x = element_text(size = 12, color = '#ffffff', hjust=0.01)
+        )
+
+
+```
+
+
+
+### Modeling
+
+
+
+```{r run regressions}
+
+# Model A - just time (hour), day of the week and weather
+reg1 <- lm(tripCount ~
+             hour(interval60) +
+             dotw +
+             Temperature,
+           data = bikeTrain)
+
+# Model B - just space (station), day of the week and weather 
+reg2 <- lm(tripCount ~
+             station +
+             GEOID +
+             nhood +
+             dotw + Temperature,
+           data = bikeTrain)
+
+# Model C - time and space
+reg3 <- lm(tripCount ~
+             station +
+             GEOID +
+             nhood + 
+             hour(interval60) +
+             dotw +
+             Temperature,
+           data = bikeTrain)
+
+reg4 <- lm(tripCount ~
+             station +
+             GEOID +
+             nhood +
+             hour(interval60) +
+             dotw +
+             Temperature +
+             lagHour +
+             lag2Hours +
+             lag3Hours +
+             lag12Hours +
+             lag1day,
+           data = bikeTrain)
+
+```
+
+
+Four models are produced from the initial 3-2 week training-test split , with increasing complexity, from a just time based, just spatial based, a time-spatial model to a time spatial with lagged features model. As can be observed in the following chart, the greatest improvement to the model is made by adding the lagged variables, given that things that happen in time (as well as in space) are more related to closer events than to farther events. 
+
+
+
+```{r nest test set}
+
+bikeTest_weekNest <- 
+  as.data.frame(bikeTest) %>%
+  nest(-week) 
+
+
+# define function to return predictions based on a dataset of nested tibbles and a regression model
+modelPred <- function(dat, fit){
+   pred <- predict(fit, newdata = dat)}
+
+# return predictions into a tibble of tibbles
+weekPredictions <- 
+  bikeTest_weekNest %>% 
+    mutate(A_Time_FE = map(.x = data, fit = reg1, .f = modelPred),
+           B_Space_FE = map(.x = data, fit = reg2, .f = modelPred),
+           C_Space_Time_FE = map(.x = data, fit = reg3, .f = modelPred),
+           D_Space_Time_Lags = map(.x = data, fit = reg4, .f = modelPred))
+
+
+weekPredictions <- weekPredictions %>%
+    gather(Regression, Prediction, -data, -week) %>%                        # turn into long form by week
+    mutate(Observed = map(data, pull, tripCount),
+           absoluteError = map2(Observed, Prediction, ~abs(.x - .y)),       # apply absolute error function
+           MAE = map_dbl(absoluteError, mean),                              # get mean of absolute error
+           sd_AE = map_dbl(absoluteError, sd))                              # get SD of absolute error
+
+
+```
+
+
+
+```{r MAE chart, fig.height=4.5, fig.width=6}
+
+# chart Mean Absolute Errors by model specifications and Week
+weekPredictions %>%
+  dplyr::select(week, Regression, MAE) %>%
+  gather(Variable, MAE, -Regression, -week) %>%
+  ggplot(aes(week, MAE)) + 
+  geom_bar(aes(fill = Regression), alpha=.9, position = "dodge", stat="identity") +
+  scale_x_continuous(breaks = c(42,43)) +
+  scale_fill_manual(values = palette5) +
+  labs(title = "Mean Absolute Errors",
+       subtitle = 'by model specification and week') +
+  plotTheme() +
+  theme(legend.position = "bottom",
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "#222222"),
+        panel.grid = element_blank(),
+        panel.grid.major.x =  element_blank(),
+        strip.text.x = element_text(size = 12)
+        )
+
+```
+
+A better notion of how much the fitness of the models improves is given by looking at ridership as a function of time for both the predicted and the actual ridership.
+
+
+```{r predictions by model, fig.width=12, fig.height=9}
+
+weekPredictions %>% 
+  mutate(interval60 = map(data, pull, interval60),
+         station = map(data, pull, station)) %>%
+  dplyr::select(interval60, station, Observed, Prediction, Regression) %>%
+  unnest() %>%
+  gather(Variable, Value, -Regression, -interval60, -station) %>%
+    group_by(Regression, Variable, interval60) %>%
+    summarize(Value = mean(Value)) %>%
+    ggplot(aes(interval60, Value, colour=Variable)) + geom_line(size = 1.1) + 
+      facet_wrap(~Regression, ncol=1) +
+      scale_colour_manual(values = c('#91bfdb','#fc8d59')) +
+      labs(title = "Mean Predicted/Observed ride share by hourly interval", 
+           subtitle='Weeks of October 14 and 21, 2019',
+           x = "Hour", y= "Rideshare Trips") +
+      plotTheme()  +
+  theme(legend.position = "bottom",
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "#222222"),
+        panel.grid.major =  element_blank(),
+        panel.grid.minor.y = element_line(color = "#535353"),
+        strip.background = element_rect(fill = "#222222"),
+        strip.text.x = element_text(size = 12, color = '#ffffff', hjust=0.01))
+
+```
+
+
+
+The Mean Average Error by stations are calculated for the `D_Space_Time_Lags` model, which proved to be the most effective one in approximating the observed values.
+
+As with the `tripCount`s that describe the number of rides, the errors are concentrated on the most dense areas of Williamsburg and the area around Flatbush Avenue, coming south from Downtown Brooklyn.
+
+
+```{r errorMaps, fig.height=6, fig.width=12}
+
+# select best regression model and get value by station (or tract)
+errors <- weekPredictions %>%
+  filter(Regression == "D_Space_Time_Lags") %>% 
+  unnest %>%
+  #left_join(bklynStations, by=c("station" = "id")) %>%
+  st_sf()
+
+# get total MAE per weeks 42 and 43
+errorWeek <- errors %>%
+  dplyr::select(station, absoluteError, week, geometry) %>%
+  gather(Variable, Value, -station, -week, -geometry) %>%
+    group_by(Variable, station, week) %>%
+    summarize(MAE = mean(Value))
+
+
+# get MAE per hour on Tuesday October 14
+errorDay <- errors %>%
+    dplyr::select(station,
+                  absoluteError,
+                  geometry,
+                  interval60)%>%
+    gather(Variable,
+           Value,
+           -interval60,
+           -station,
+           -geometry) %>%
+    filter(wday(interval60, label = TRUE) == "Tue" & week(interval60) == 42) %>%
+    group_by(hour = hour(interval60), station) %>%
+    summarize(MAE = mean(Value)) 
+
+
+# map of error by weeks
+errorWeek %>%
+  ggplot() +
+  geom_sf(data=tripTracts, colour = "#222222", fill = "#3a3a3a") +
+  geom_sf(pch = 21,
+          colour = 'NA',
+          alpha = 0.75,
+          aes(size = MAE,
+          fill = MAE)) +
+  facet_wrap(~week, ncol = 2) +
+  scale_fill_gradient(low='#91bfdb',
+                       high='#fc8d59',
+                      guide='colorbar') +
+  scale_size_continuous(range = c(0,6)) +
+  labs(title="Mean Absolute Error per week and station",
+       subtitle = "Citi Bike Stations in Brooklyn") +
+  guides(size=F,
+         fill=guide_colorbar(title="MAE", barwidth = 20)) +
+  mapTheme() +
+  theme(legend.position = "bottom",
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "#222222"),
+        panel.grid = element_blank(),
+        strip.background = element_rect(fill = "#222222"),
+        strip.text.x = element_text(size = 16, color = '#ffffff', hjust=0.01)
+        )
+
+```
+
+Errors can also be unfolded through time in more detail, and the early morning and afternoon peaks have larger errors than other periods of time.
+
+
+```{r error map day, fig.height=15, fig.width=9}
+
+# make a map of MAES by hour of day
+errorDay %>%
+  ggplot() +
+  geom_sf(data=tripTracts, colour = "#222222", fill = "#3a3a3a") +
+  geom_sf(pch = 21,
+          colour = 'NA',
+          alpha = 0.75,
+          aes(size = MAE,
+          fill = MAE)) +
+  facet_wrap(~hour, ncol = 4) +
+  scale_fill_gradient(low='#91bfdb',
+                       high='#fc8d59',
+                      guide='colorbar') +
+  scale_size_continuous(range = c(0,4)) +
+  labs(title="Mean Absosulte Error per week and station",
+       subtitle = "Citi Bike Stations in Brooklyn") +
+  guides(size=F,
+         fill=guide_colorbar(title="MAE", barwidth = 20)) +
+  mapTheme() +
+  theme(legend.position = "bottom",
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "#222222"),
+        panel.grid = element_blank(),
+        strip.background = element_rect(fill = "#222222"),
+        strip.text.x = element_text(size = 12, color = '#ffffff', hjust=0.05)
+        )
+
+```
+
+
+
+---
+
+### Cross-validation
+
+Finally, two Leave-One-Group-Out cross validations are made on the whole 5-week data, the first based in the 21 NTA neighborhoods in Brooklyn that have Citi bike docks, and the second one on the 167 census tracts in Brooklyn where stations are present.
+
+
+```{r crossvalidation}
+
+# CrossValidations: by neighborhood or census tract.
+# define cross validation formula
+crossValidate <- function(dataset, id, dependentVariable, indVariables, indVariableName) {
+  
+  allPredictions <- data.frame()
+  cvID_list <- unique(dataset[[id]])
+  
+  for (i in cvID_list) {
+    
+    thisFold <- i
+    cat("This hold out fold is", thisFold, "\n")
+    
+    fold.train <- filter(dataset, dataset[[id]] != thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, geometry, indVariables, dependentVariable)
+    fold.test  <- filter(dataset, dataset[[id]] == thisFold) %>% as.data.frame() %>% 
+      dplyr::select(id, geometry, indVariables, dependentVariable)
+    
+    regression <-
+      lm(tripCount ~ .,
+          data = fold.train %>% 
+            dplyr::select(-geometry, -id))
+    
+    thisPrediction <- 
+      mutate(fold.test, Prediction = predict(regression, fold.test, type = "response"))
+    
+    allPredictions <-
+      rbind(allPredictions, thisPrediction)
+    
+  }
+  return(st_sf(allPredictions))
+}
+
+
+# Run four regressions by model
+# regression with LOGO-CV and no spatial features 
+
+regVars <-  c('nhood',
+              'interval60',
+              'dotw',
+              'Temperature',
+              'lagHour',
+              'lag2Hours',
+              'lag3Hours',
+              'lag12Hours',
+              'lag1day')
+
+# crossValidate per neighborhoods
+regCVnhood <- crossValidate(
+  dataset = bikePanelSpatial,
+  id = "nhood",
+  dependentVariable = "tripCount",
+  indVariables = regVars) %>%
+    dplyr::select(cvID = nhood, tripCount, Prediction, geometry)
+
+
+# CV by tracts
+regVarsTr <-  c('GEOID',
+              'interval60',
+              'dotw',
+              'Temperature',
+              'lagHour',
+              'lag2Hours',
+              'lag3Hours',
+              'lag12Hours',
+              'lag1day')
+
+
+# cross validate per census tracts
+regCVtract <- crossValidate(
+  dataset = bikePanelSpatial,
+  id = "GEOID",
+  dependentVariable = "tripCount",
+  indVariables = regVarsTr) %>%
+    dplyr::select(cvID = GEOID, tripCount, Prediction, geometry)
+
+
+# compute errors and MAE by station/hour
+regCV1 <- regCVnhood %>%
+  st_drop_geometry() %>%
+  mutate(regression = 'spatial CV neighborhoods',             # identify regression
+         interval60 = bikePanelSpatial$interval60,            # join time back
+         week = week(interval60)) %>% 
+  mutate(station = bikePanelSpatial$station) %>%              # join stations back
+  rename('Observed' = tripCount) %>%
+  mutate(absoluteError = abs(Observed - Prediction))          # get absolute error
+
+
+# compute errors and MAE by station/hour
+regCV2 <- regCVtract %>% 
+  st_drop_geometry() %>%
+  mutate(regression = 'spatial CV tracts',                    # identify regression
+         interval60 =  bikePanelSpatial$interval60,           # join time back
+         week = week(interval60)) %>%       
+  mutate(station = bikePanelSpatial$station) %>%              # join stations back
+  rename('Observed' = tripCount) %>%
+  mutate(absoluteError = abs(Observed - Prediction))          # get absolute error
+
+
+
+```
+
+
+The prediction power of the LOGO-CV models is visualized by looking at the Mean Average Error of each model by week in the following chart:
+
+
+```{r CV model comparison chart}
+
+weekPredictionsCV <- rbind(regCV1, regCV2) %>%
+  group_by(regression, week) %>%
+  summarize(MAE = mean(absoluteError, na.rm=T),
+            sd_AE = sd(absoluteError, na.rm=T)) %>%
+  ungroup()
+
+
+# chart Mean Absolute Errors by model specifications and Week
+weekPredictionsCV %>%
+  dplyr::select(week, regression, MAE) %>%
+  #group_by(week, regression, MAE) %>%
+  #summarize(MAE = mean(MAE, na.rm=T)) %>%
+  ggplot(aes(week, MAE)) + 
+  geom_bar(aes(fill = regression), alpha=.9, position = "dodge", stat="identity") +
+  scale_x_continuous(breaks = c(39,40,41,42,43)) +
+  scale_fill_manual(values = c('#91bfdb','#fc8d59')) +
+  labs(title = "CV models: Mean Absolute Errors",
+       subtitle = 'by model specification and week') +
+  plotTheme() +
+  theme(legend.position = "bottom",
+        panel.border = element_blank(),
+        panel.background = element_rect(fill = "#222222"),
+        panel.grid = element_blank(),
+        panel.grid.major.x =  element_blank(),
+        strip.text.x = element_text(size = 12)
+        )
+
+
+```
+
+
+There is just a small improvement between the 167 census tract model group cross-validation from the 21 neighborhood CV model. As expected, week 39 is more difficult to predict as it lacks some of the lagged trip information that are available for the following weeks. 
+
+
+---
+
+### Conclusion
+
+
+The model just described provides a predicting tool for the future behavior of the system that can be used to deploy and plan the re-balancing distribution trucks that support Citi bike's system in a more efficient way, bringing the ability to reduce re-stocking trips while securing bike availability for users throughout the system.
+
+Nevertheless, to provide a complete operational system for managing Citi bike’s demand and supply, this algorithm needs to be coupled with each stations’ dock capacity and its capacity by hours of the day, modeled in the same way as the trip generation. This way, the trips started can be related to the amount of bikes left in that particular station and the rate at which they are checked out (or checked in) can be used to predict the risk of stations being left empty or completely full.
+
+
+
+
+
